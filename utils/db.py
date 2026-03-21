@@ -1,492 +1,580 @@
-import sqlite3
-import os
-import pandas as pd
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import streamlit as st
 import requests
-from datetime import datetime, date
-import threading
+from datetime import datetime, date, timedelta
+from utils.crypto import encrypt, decrypt, title_case, fmt_date
 
-USER_DB = "qavi_users.db"
-MARKET_DB = "qavi_market.db"
+# ── CACHE BUST ────────────────────────────────────────────────────────────
+# Incremented after any market data upload so cached queries re-run immediately.
+def _bust() -> int:
+    return st.session_state.get("_cache_v", 0)
 
-# Thread-local connections
-_local = threading.local()
+# ── SUPABASE CLIENT ───────────────────────────────────────────────────────
+# Set in Streamlit secrets:
+#   SUPABASE_URL = "https://xxxx.supabase.co"
+#   SUPABASE_KEY = "your-anon-public-key"
 
-def get_user_conn():
-    if not hasattr(_local, "user_conn") or _local.user_conn is None:
-        _local.user_conn = sqlite3.connect(USER_DB, check_same_thread=False)
-        _local.user_conn.row_factory = sqlite3.Row
-    return _local.user_conn
-
-def get_market_conn():
-    if not hasattr(_local, "market_conn") or _local.market_conn is None:
-        _local.market_conn = sqlite3.connect(MARKET_DB, check_same_thread=False)
-        _local.market_conn.row_factory = sqlite3.Row
-    return _local.market_conn
-
-# -------------------------------------------------------
-# SCHEMA SETUP
-# -------------------------------------------------------
-
-def init_databases():
-    _init_user_db()
-    _init_market_db()
-    _seed_market_data()
-
-def _init_user_db():
-    conn = get_user_conn()
-    c = conn.cursor()
-
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        role TEXT NOT NULL CHECK(role IN ('advisor','client')),
-        full_name TEXT DEFAULT '',
-        email TEXT DEFAULT '',
-        phone TEXT DEFAULT '',
-        pan TEXT DEFAULT '',
-        risk_profile TEXT DEFAULT 'Moderate',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS advisor_clients (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        advisor_id INTEGER NOT NULL,
-        client_id INTEGER NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(advisor_id) REFERENCES users(id),
-        FOREIGN KEY(client_id) REFERENCES users(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS portfolios (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        client_id INTEGER NOT NULL,
-        name TEXT NOT NULL,
-        description TEXT DEFAULT '',
-        goal TEXT DEFAULT '',
-        target_amount REAL DEFAULT 0,
-        target_date TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(client_id) REFERENCES users(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS holdings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        portfolio_id INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
-        asset_class TEXT NOT NULL,
-        quantity REAL NOT NULL,
-        avg_cost REAL DEFAULT 0,
-        buy_date TEXT DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(portfolio_id) REFERENCES portfolios(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        portfolio_id INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
-        txn_type TEXT NOT NULL CHECK(txn_type IN ('BUY','SELL','DIVIDEND','SIP')),
-        quantity REAL NOT NULL,
-        price REAL NOT NULL,
-        amount REAL NOT NULL,
-        txn_date TEXT DEFAULT CURRENT_TIMESTAMP,
-        notes TEXT DEFAULT '',
-        FOREIGN KEY(portfolio_id) REFERENCES portfolios(id)
-    );
-    """)
-    conn.commit()
-
-def _init_market_db():
-    conn = get_market_conn()
-    c = conn.cursor()
-
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS assets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT UNIQUE NOT NULL,
-        name TEXT NOT NULL,
-        asset_class TEXT NOT NULL,
-        sector TEXT DEFAULT '',
-        exchange TEXT DEFAULT 'NSE',
-        isin TEXT DEFAULT '',
-        face_value REAL DEFAULT 10,
-        last_updated TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS prices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        price DATE DEFAULT CURRENT_DATE,
-        open REAL DEFAULT 0,
-        high REAL DEFAULT 0,
-        low REAL DEFAULT 0,
-        close REAL NOT NULL,
-        prev_close REAL DEFAULT 0,
-        change_pct REAL DEFAULT 0,
-        volume INTEGER DEFAULT 0,
-        market_cap REAL DEFAULT 0,
-        last_updated TEXT DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(symbol, price)
-    );
-
-    CREATE TABLE IF NOT EXISTS mutual_funds (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        scheme_code TEXT UNIQUE NOT NULL,
-        symbol TEXT NOT NULL,
-        name TEXT NOT NULL,
-        fund_house TEXT DEFAULT '',
-        category TEXT DEFAULT '',
-        sub_category TEXT DEFAULT '',
-        nav REAL DEFAULT 0,
-        prev_nav REAL DEFAULT 0,
-        change_pct REAL DEFAULT 0,
-        aum REAL DEFAULT 0,
-        expense_ratio REAL DEFAULT 0,
-        last_updated TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS indices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT UNIQUE NOT NULL,
-        name TEXT NOT NULL,
-        value REAL DEFAULT 0,
-        prev_value REAL DEFAULT 0,
-        change_pct REAL DEFAULT 0,
-        last_updated TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-    conn.commit()
-
-# -------------------------------------------------------
-# SEED STATIC MARKET DATA (fallback / demo)
-# -------------------------------------------------------
-
-SEED_EQUITIES = [
-    # Large Cap
-    ("RELIANCE","Reliance Industries","Equity","Energy","NSE"),
-    ("INFY","Infosys Ltd","Equity","IT","NSE"),
-    ("TCS","Tata Consultancy Services","Equity","IT","NSE"),
-    ("HDFCBANK","HDFC Bank Ltd","Equity","Banking","NSE"),
-    ("ICICIBANK","ICICI Bank Ltd","Equity","Banking","NSE"),
-    ("KOTAKBANK","Kotak Mahindra Bank","Equity","Banking","NSE"),
-    ("HINDUNILVR","Hindustan Unilever","Equity","FMCG","NSE"),
-    ("ITC","ITC Ltd","Equity","FMCG","NSE"),
-    ("BHARTIARTL","Bharti Airtel","Equity","Telecom","NSE"),
-    ("AXISBANK","Axis Bank Ltd","Equity","Banking","NSE"),
-    ("LT","Larsen & Toubro","Equity","Capital Goods","NSE"),
-    ("WIPRO","Wipro Ltd","Equity","IT","NSE"),
-    ("BAJFINANCE","Bajaj Finance","Equity","NBFC","NSE"),
-    ("MARUTI","Maruti Suzuki","Equity","Auto","NSE"),
-    ("TITAN","Titan Company","Equity","Consumer","NSE"),
-    ("ASIANPAINT","Asian Paints","Equity","Paint","NSE"),
-    ("NESTLEIND","Nestle India","Equity","FMCG","NSE"),
-    ("ULTRACEMCO","UltraTech Cement","Equity","Cement","NSE"),
-    ("SUNPHARMA","Sun Pharmaceutical","Equity","Pharma","NSE"),
-    ("DRREDDY","Dr Reddy's Labs","Equity","Pharma","NSE"),
-]
-
-SEED_ETFS = [
-    ("NIFTYBEES","Nippon Nifty BeES","ETF","Index ETF","NSE"),
-    ("GOLDBEES","Nippon Gold BeES","ETF","Gold ETF","NSE"),
-    ("BANKBEES","Nippon Bank BeES","ETF","Sectoral ETF","NSE"),
-    ("JUNIORBEES","Nippon Junior BeES","ETF","Index ETF","NSE"),
-    ("ICICIB22","ICICI Bharat 22 ETF","ETF","Index ETF","NSE"),
-    ("LIQUIDBEES","Nippon Liquid BeES","ETF","Liquid ETF","NSE"),
-    ("ITBEES","Nippon IT BeES","ETF","Sectoral ETF","NSE"),
-    ("SETFNIF50","SBI ETF Nifty 50","ETF","Index ETF","NSE"),
-    ("MOM100","Motilal Nifty Midcap 100","ETF","Index ETF","NSE"),
-    ("SILVERBEES","Nippon Silver BeES","ETF","Commodity ETF","NSE"),
-]
-
-SEED_BONDS = [
-    ("GSEC_10Y","10-Year G-Sec Bond","Bond","Government","BSE"),
-    ("GSEC_5Y","5-Year G-Sec Bond","Bond","Government","BSE"),
-    ("NHAI_BOND","NHAI Infrastructure Bond","Bond","PSU","BSE"),
-    ("REC_BOND","REC Tax-Free Bond","Bond","PSU","BSE"),
-    ("HDFC_NCD","HDFC NCD Series","Bond","Corporate","BSE"),
-    ("BAJAJ_NCD","Bajaj Finance NCD","Bond","Corporate","BSE"),
-    ("TATA_NCD","Tata Capital NCD","Bond","Corporate","BSE"),
-    ("SGB_2028","Sovereign Gold Bond 2028","Bond","Gold Bond","BSE"),
-    ("SGB_2030","Sovereign Gold Bond 2030","Bond","Gold Bond","BSE"),
-    ("IRFC_BOND","IRFC Tax-Free Bond","Bond","PSU","BSE"),
-]
-
-SEED_MFS = [
-    ("120503","HDFC_TOP100","HDFC Top 100 Fund","HDFC AMC","Equity","Large Cap"),
-    ("100119","SBI_BLUECHIP","SBI Bluechip Fund","SBI MF","Equity","Large Cap"),
-    ("118989","AXIS_MIDCAP","Axis Midcap Fund","Axis MF","Equity","Mid Cap"),
-    ("100341","MIRAE_EMERGING","Mirae Emerging Bluechip","Mirae Asset","Equity","Large & Mid Cap"),
-    ("122639","PARAG_FLEXI","Parag Parikh Flexi Cap","PPFAS MF","Equity","Flexi Cap"),
-    ("119598","ICICI_BLUECHIP","ICICI Pru Bluechip","ICICI MF","Equity","Large Cap"),
-    ("119062","KOTAK_SMALLCAP","Kotak Small Cap Fund","Kotak MF","Equity","Small Cap"),
-    ("100444","DSP_MIDCAP","DSP Midcap Fund","DSP MF","Equity","Mid Cap"),
-    ("106655","NIPPON_SMALLCAP","Nippon Small Cap Fund","Nippon MF","Equity","Small Cap"),
-    ("100270","FRANKLIN_PRIMA","Franklin India Prima Fund","Franklin MF","Equity","Mid Cap"),
-    ("120505","HDFC_LIQUID","HDFC Liquid Fund","HDFC AMC","Debt","Liquid"),
-    ("119551","ICICI_LIQUID","ICICI Pru Liquid Fund","ICICI MF","Debt","Liquid"),
-    ("100595","AXIS_ELSS","Axis Long Term Equity","Axis MF","ELSS","Tax Saver"),
-    ("100122","SBI_ELSS","SBI Long Term Equity","SBI MF","ELSS","Tax Saver"),
-    ("135781","ICICI_BALANCED","ICICI Pru Balanced Advantage","ICICI MF","Hybrid","BAF"),
-]
-
-SEED_INDICES = [
-    ("NIFTY50","Nifty 50",22500,22100),
-    ("SENSEX","BSE Sensex",74000,72800),
-    ("NIFTYBANK","Nifty Bank",48000,47200),
-    ("NIFTYMIDCAP","Nifty Midcap 100",52000,51200),
-    ("NIFTYSMALLCAP","Nifty Smallcap 100",15000,14700),
-    ("NIFTYIT","Nifty IT",34000,33500),
-    ("NIFTYPHARMA","Nifty Pharma",18500,18200),
-    ("INDIA_VIX","India VIX",14.5,15.2),
-]
-
-# Demo prices for equities
-DEMO_PRICES = {
-    "RELIANCE": (2940, 2910, 2880, 2930, 2900),
-    "INFY": (1820, 1800, 1780, 1815, 1790),
-    "TCS": (4220, 4180, 4160, 4210, 4170),
-    "HDFCBANK": (1680, 1660, 1645, 1675, 1658),
-    "ICICIBANK": (1250, 1235, 1220, 1248, 1232),
-    "KOTAKBANK": (1760, 1740, 1720, 1755, 1738),
-    "HINDUNILVR": (2720, 2695, 2680, 2715, 2692),
-    "ITC": (475, 470, 465, 474, 469),
-    "BHARTIARTL": (1580, 1560, 1545, 1575, 1558),
-    "AXISBANK": (1155, 1140, 1125, 1150, 1138),
-    "LT": (3620, 3590, 3565, 3615, 3588),
-    "WIPRO": (562, 556, 550, 560, 554),
-    "BAJFINANCE": (6820, 6760, 6710, 6810, 6752),
-    "MARUTI": (12500, 12380, 12280, 12480, 12360),
-    "TITAN": (3580, 3545, 3515, 3572, 3540),
-    "ASIANPAINT": (2840, 2810, 2785, 2835, 2805),
-    "NESTLEIND": (2480, 2455, 2435, 2475, 2450),
-    "ULTRACEMCO": (10850, 10720, 10620, 10830, 10700),
-    "SUNPHARMA": (1680, 1660, 1643, 1676, 1657),
-    "DRREDDY": (1320, 1305, 1290, 1316, 1302),
-    "NIFTYBEES": (248, 245, 242, 247, 244),
-    "GOLDBEES": (56.8, 56.2, 55.8, 56.6, 56.1),
-    "BANKBEES": (485, 480, 474, 483, 478),
-    "JUNIORBEES": (752, 744, 737, 749, 742),
-    "ICICIB22": (98.5, 97.8, 97.1, 98.3, 97.6),
-    "LIQUIDBEES": (1000, 1000, 1000, 1000, 1000),
-    "ITBEES": (340, 336, 332, 339, 335),
-    "SETFNIF50": (248, 245, 242, 247, 244),
-    "MOM100": (81, 80, 79, 81, 80),
-    "SILVERBEES": (87, 86, 85, 87, 86),
-    "GSEC_10Y": (100.5, 100.3, 100.1, 100.4, 100.2),
-    "GSEC_5Y": (101.2, 101.0, 100.8, 101.1, 100.9),
-    "NHAI_BOND": (1050, 1048, 1046, 1049, 1047),
-    "REC_BOND": (1080, 1078, 1075, 1079, 1077),
-    "HDFC_NCD": (1005, 1003, 1001, 1004, 1002),
-    "BAJAJ_NCD": (1010, 1008, 1006, 1009, 1007),
-    "TATA_NCD": (1008, 1006, 1004, 1007, 1005),
-    "SGB_2028": (7250, 7200, 7160, 7240, 7190),
-    "SGB_2030": (7450, 7400, 7360, 7440, 7390),
-    "IRFC_BOND": (1020, 1018, 1016, 1019, 1017),
-}
-
-DEMO_NAV = {
-    "HDFC_TOP100": (850, 842),
-    "SBI_BLUECHIP": (72, 71.2),
-    "AXIS_MIDCAP": (95, 93.8),
-    "MIRAE_EMERGING": (115, 113.5),
-    "PARAG_FLEXI": (68, 67.1),
-    "ICICI_BLUECHIP": (88, 87.2),
-    "KOTAK_SMALLCAP": (220, 217),
-    "DSP_MIDCAP": (118, 116.5),
-    "NIPPON_SMALLCAP": (165, 162.5),
-    "FRANKLIN_PRIMA": (1850, 1825),
-    "HDFC_LIQUID": (4250, 4248),
-    "ICICI_LIQUID": (380, 379.8),
-    "AXIS_ELSS": (92, 90.8),
-    "SBI_ELSS": (310, 305.5),
-    "ICICI_BALANCED": (62, 61.2),
-}
-
-def _seed_market_data():
-    conn = get_market_conn()
-    c = conn.cursor()
-    today = str(date.today())
-
-    # Assets
-    for sym, name, cls, sector, exch in SEED_EQUITIES + SEED_ETFS + SEED_BONDS:
-        c.execute("""
-            INSERT OR IGNORE INTO assets(symbol,name,asset_class,sector,exchange)
-            VALUES(?,?,?,?,?)
-        """, (sym, name, cls, sector, exch))
-
-    # Prices
-    for sym, (open_, high, low, close, prev) in DEMO_PRICES.items():
-        chg = round(((close - prev) / prev) * 100, 2)
-        c.execute("""
-            INSERT OR REPLACE INTO prices(symbol,price,open,high,low,close,prev_close,change_pct,last_updated)
-            VALUES(?,?,?,?,?,?,?,?,?)
-        """, (sym, today, open_, high, low, close, prev, chg, datetime.now().isoformat()))
-
-    # Mutual Funds
-    for code, sym, name, house, cat, subcat in SEED_MFS:
-        c.execute("""
-            INSERT OR IGNORE INTO mutual_funds(scheme_code,symbol,name,fund_house,category,sub_category)
-            VALUES(?,?,?,?,?,?)
-        """, (code, sym, name, house, cat, subcat))
-        if sym in DEMO_NAV:
-            nav, prev_nav = DEMO_NAV[sym]
-            chg = round(((nav - prev_nav) / prev_nav) * 100, 2)
-            c.execute("""
-                UPDATE mutual_funds SET nav=?, prev_nav=?, change_pct=?, last_updated=?
-                WHERE symbol=?
-            """, (nav, prev_nav, chg, datetime.now().isoformat(), sym))
-
-    # Indices
-    for sym, name, val, prev in SEED_INDICES:
-        chg = round(((val - prev) / prev) * 100, 2)
-        c.execute("""
-            INSERT OR REPLACE INTO indices(symbol,name,value,prev_value,change_pct,last_updated)
-            VALUES(?,?,?,?,?,?)
-        """, (sym, name, val, prev, chg, datetime.now().isoformat()))
-
-    conn.commit()
-
-# -------------------------------------------------------
-# HELPER QUERIES
-# -------------------------------------------------------
-
-def get_user_by_username(username):
-    conn = get_user_conn()
-    row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-    return dict(row) if row else None
-
-def get_user_by_id(uid):
-    conn = get_user_conn()
-    row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    return dict(row) if row else None
-
-def create_user(username, password, role, full_name="", email=""):
-    conn = get_user_conn()
+@st.cache_resource
+def get_supabase():
     try:
-        conn.execute("""
-            INSERT INTO users(username,password,role,full_name,email)
-            VALUES(?,?,?,?,?)
-        """, (username, password, role, full_name, email))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+        from supabase import create_client, ClientOptions
+        url  = st.secrets["SUPABASE_URL"]
+        key  = st.secrets["SUPABASE_KEY"]
+        # Use connection pooling via Supabase's pgbouncer port when available
+        opts = ClientOptions(postgrest_client_timeout=15)
+        return create_client(url, key, options=opts)
+    except TypeError:
+        # Older supabase-py without ClientOptions
+        try:
+            from supabase import create_client
+            url = st.secrets["SUPABASE_URL"]
+            key = st.secrets["SUPABASE_KEY"]
+            return create_client(url, key)
+        except Exception as e:
+            st.error(f"Supabase connection failed: {e}")
+            return None
+    except Exception as e:
+        st.error(f"Supabase connection failed: {e}")
+        return None
 
-def update_user_profile(uid, full_name, email, phone, pan, risk_profile):
-    conn = get_user_conn()
-    conn.execute("""
-        UPDATE users SET full_name=?, email=?, phone=?, pan=?, risk_profile=?
-        WHERE id=?
-    """, (full_name, email, phone, pan, risk_profile, uid))
-    conn.commit()
+def sb():
+    return get_supabase()
+
+# ── ADVISOR KEY ───────────────────────────────────────────────────────────
+
+def get_advisor_key_hash() -> str:
+    try:
+        return st.secrets["ADVISOR_KEY_HASH"]
+    except Exception:
+        from utils.crypto import hash_advisor_key
+        return hash_advisor_key(os.environ.get("ADVISOR_KEY", "QAVI-ADV-2025"))
+
+# ── USER QUERIES ──────────────────────────────────────────────────────────
+
+def get_user_by_email(email: str):
+    r = sb().table("users").select("*").eq("email", email.lower().strip()).execute()
+    return r.data[0] if r.data else None
+
+def get_user_by_id(uid: str):
+    r = sb().table("users").select("*").eq("id", uid).execute()
+    return r.data[0] if r.data else None
+
+def get_user_by_username(username: str):
+    r = sb().table("users").select("*").eq("username", username.strip()).execute()
+    return r.data[0] if r.data else None
+
+def email_exists(email: str) -> bool:
+    r = sb().table("users").select("id").eq("email", email.lower().strip()).execute()
+    return bool(r.data)
+
+def create_user(email, username, password_hash, role, full_name="", advisor_key_hash=None):
+    data = {
+        "email": email.lower().strip(),
+        "username": username.strip(),
+        "password_hash": password_hash,
+        "role": role,
+        "full_name": title_case(full_name),
+        "advisor_key_hash": advisor_key_hash,
+    }
+    try:
+        r = sb().table("users").insert(data).execute()
+        return True, r.data[0] if r.data else None
+    except Exception as e:
+        return False, str(e)
+
+def update_user_profile(uid, full_name, phone, pan, address, dob, risk_profile):
+    sb().table("users").update({
+        "full_name": title_case(full_name),
+        "phone_enc": encrypt(phone),
+        "pan_enc": encrypt(pan.upper() if pan else ""),
+        "address_enc": encrypt(address),
+        "dob": dob,
+        "risk_profile": risk_profile,
+    }).eq("id", uid).execute()
+
+def set_reset_token(email, token, expiry_iso):
+    sb().table("users").update({
+        "password_reset_token": token,
+        "password_reset_expiry": expiry_iso,
+    }).eq("email", email.lower()).execute()
+
+def get_user_by_reset_token(token):
+    r = sb().table("users").select("*").eq("password_reset_token", token).execute()
+    return r.data[0] if r.data else None
+
+def update_password(uid, new_hash):
+    sb().table("users").update({
+        "password_hash": new_hash,
+        "password_reset_token": None,
+        "password_reset_expiry": None,
+    }).eq("id", uid).execute()
+
+def get_all_advisors():
+    r = sb().table("users").select("id,username,full_name,email").eq("role", "advisor").execute()
+    return r.data or []
+
+def decrypt_user(user: dict) -> dict:
+    """Return a copy of user dict with decrypted PII fields."""
+    if not user:
+        return {}
+    u = dict(user)
+    u["phone"] = decrypt(u.get("phone_enc", ""))
+    u["pan"] = decrypt(u.get("pan_enc", ""))
+    u["address"] = decrypt(u.get("address_enc", ""))
+    return u
+
+# ── ADVISOR-CLIENT ────────────────────────────────────────────────────────
 
 def get_advisor_clients(advisor_id):
-    conn = get_user_conn()
-    rows = conn.execute("""
-        SELECT u.id, u.username, u.full_name, u.email, u.risk_profile, ac.created_at
-        FROM advisor_clients ac
-        JOIN users u ON ac.client_id = u.id
-        WHERE ac.advisor_id=?
-    """, (advisor_id,)).fetchall()
-    return [dict(r) for r in rows]
+    r = sb().table("advisor_clients").select("*").eq("advisor_id", advisor_id).execute()
+    result = []
+    for ac in (r.data or []):
+        ac["client_email"] = decrypt(ac.get("client_email_enc", ""))
+        ac["client_phone"] = decrypt(ac.get("client_phone_enc", ""))
+        ac["client_pan"] = decrypt(ac.get("client_pan_enc", ""))
+        ac["notes"] = decrypt(ac.get("notes_enc", ""))
+        result.append(ac)
+    return result
 
-def link_client(advisor_id, client_id):
-    conn = get_user_conn()
-    try:
-        conn.execute("INSERT INTO advisor_clients(advisor_id,client_id) VALUES(?,?)",
-                     (advisor_id, client_id))
-        conn.commit()
-        return True
-    except:
-        return False
+def get_advisor_client(ac_id):
+    r = sb().table("advisor_clients").select("*").eq("id", ac_id).execute()
+    if not r.data:
+        return None
+    ac = r.data[0]
+    ac["client_email"] = decrypt(ac.get("client_email_enc", ""))
+    ac["client_phone"] = decrypt(ac.get("client_phone_enc", ""))
+    ac["client_pan"] = decrypt(ac.get("client_pan_enc", ""))
+    ac["notes"] = decrypt(ac.get("notes_enc", ""))
+    return ac
 
-def get_client_portfolios(client_id):
-    conn = get_user_conn()
-    rows = conn.execute("SELECT * FROM portfolios WHERE client_id=?", (client_id,)).fetchall()
-    return [dict(r) for r in rows]
+def create_advisor_client(advisor_id, client_name, email="", phone="", pan="",
+                          risk_profile="Moderate", notes="", fee_type="one_time",
+                          fee_value=0, fee_frequency="annual"):
+    sb().table("advisor_clients").insert({
+        "advisor_id": advisor_id,
+        "client_name": title_case(client_name),
+        "client_email_enc": encrypt(email.lower()),
+        "client_phone_enc": encrypt(phone),
+        "client_pan_enc": encrypt(pan.upper() if pan else ""),
+        "risk_profile": risk_profile,
+        "notes_enc": encrypt(notes),
+        "fee_type": fee_type,
+        "fee_value": fee_value,
+        "fee_frequency": fee_frequency,
+        "is_registered": False,
+    }).execute()
 
-def create_portfolio(client_id, name, description="", goal="", target_amount=0, target_date=""):
-    conn = get_user_conn()
-    conn.execute("""
-        INSERT INTO portfolios(client_id,name,description,goal,target_amount,target_date)
-        VALUES(?,?,?,?,?,?)
-    """, (client_id, name, description, goal, target_amount, target_date))
-    conn.commit()
+def link_registered_client(advisor_id, email):
+    user = get_user_by_email(email)
+    if not user or user["role"] != "client":
+        return False, "No client account found with that email."
+    already = sb().table("advisor_clients").select("id").eq("advisor_id", advisor_id).eq("client_id", user["id"]).execute()
+    if already.data:
+        return False, "Client already linked."
+    sb().table("advisor_clients").insert({
+        "advisor_id": advisor_id,
+        "client_id": user["id"],
+        "client_name": user.get("full_name", ""),
+        "client_email_enc": encrypt(user.get("email", "")),
+        "client_phone_enc": encrypt(decrypt(user.get("phone_enc", ""))),
+        "risk_profile": user.get("risk_profile", "Moderate"),
+        "is_registered": True,
+    }).execute()
+    return True, "Client linked successfully."
+
+def update_advisor_client(ac_id, client_name, email, phone, pan,
+                          risk_profile, notes, fee_type, fee_value, fee_frequency):
+    sb().table("advisor_clients").update({
+        "client_name": title_case(client_name),
+        "client_email_enc": encrypt(email.lower()),
+        "client_phone_enc": encrypt(phone),
+        "client_pan_enc": encrypt(pan.upper() if pan else ""),
+        "risk_profile": risk_profile,
+        "notes_enc": encrypt(notes),
+        "fee_type": fee_type,
+        "fee_value": fee_value,
+        "fee_frequency": fee_frequency,
+    }).eq("id", ac_id).execute()
+
+def delete_advisor_client(ac_id):
+    # Cascade handled by DB foreign keys
+    sb().table("advisor_clients").delete().eq("id", ac_id).execute()
+
+def get_client_advisors(client_user_id):
+    r = sb().table("advisor_clients").select("*, users!advisor_clients_advisor_id_fkey(full_name,email,phone_enc)").eq("client_id", client_user_id).execute()
+    result = []
+    for ac in (r.data or []):
+        ac["advisor_name"] = ac.get("users", {}).get("full_name", "Advisor") if ac.get("users") else "Advisor"
+        ac["advisor_email"] = ac.get("users", {}).get("email", "") if ac.get("users") else ""
+        ac["client_email"] = decrypt(ac.get("client_email_enc", ""))
+        result.append(ac)
+    return result
+
+# ── PORTFOLIOS ────────────────────────────────────────────────────────────
+
+def get_portfolios_for_ac(ac_id, visibility=None):
+    q = sb().table("portfolios").select("*").eq("advisor_client_id", ac_id)
+    if visibility:
+        q = q.eq("visibility", visibility)
+    return q.execute().data or []
+
+def get_private_portfolios(owner_id):
+    r = sb().table("portfolios").select("*").eq("owner_id", owner_id).eq("visibility", "private").execute()
+    return r.data or []
+
+def get_portfolio_by_id(pf_id):
+    r = sb().table("portfolios").select("*").eq("id", pf_id).execute()
+    return r.data[0] if r.data else None
+
+def create_portfolio(ac_id, owner_id, owner_type, name, description="", goal="",
+                     target_amount=0, target_date="", visibility="shared", benchmark="NIFTY50"):
+    sb().table("portfolios").insert({
+        "advisor_client_id": ac_id,
+        "owner_id": owner_id,
+        "owner_type": owner_type,
+        "name": name,
+        "description": description,
+        "goal": goal,
+        "target_amount": target_amount,
+        "target_date": target_date,
+        "visibility": visibility,
+        "benchmark": benchmark,
+    }).execute()
+
+def update_portfolio(pf_id, name, description, goal, target_amount, target_date, benchmark):
+    sb().table("portfolios").update({
+        "name": name, "description": description, "goal": goal,
+        "target_amount": target_amount, "target_date": target_date, "benchmark": benchmark,
+    }).eq("id", pf_id).execute()
+
+def delete_portfolio(pf_id):
+    sb().table("portfolios").delete().eq("id", pf_id).execute()
+
+# ── HOLDINGS ──────────────────────────────────────────────────────────────
 
 def get_portfolio_holdings(portfolio_id):
-    conn = get_user_conn()
-    rows = conn.execute("SELECT * FROM holdings WHERE portfolio_id=?", (portfolio_id,)).fetchall()
-    return [dict(r) for r in rows]
+    r = sb().table("holdings").select("*").eq("portfolio_id", portfolio_id).execute()
+    return r.data or []
 
-def add_holding(portfolio_id, symbol, asset_class, quantity, avg_cost):
-    conn = get_user_conn()
-    # Check if holding exists — update quantity
-    existing = conn.execute(
-        "SELECT id, quantity, avg_cost FROM holdings WHERE portfolio_id=? AND symbol=?",
-        (portfolio_id, symbol)
-    ).fetchone()
-    if existing:
-        old_qty = existing["quantity"]
-        old_cost = existing["avg_cost"]
+def add_holding(portfolio_id, symbol, asset_class, sub_class, quantity,
+                unit_type, avg_cost, notes="", is_manual=False):
+    # Check existing
+    existing = sb().table("holdings").select("id,quantity,avg_cost").eq("portfolio_id", portfolio_id).eq("symbol", symbol).execute()
+    if existing.data:
+        h = existing.data[0]
+        old_qty = h["quantity"]; old_cost = h["avg_cost"]
         new_qty = old_qty + quantity
         new_avg = ((old_qty * old_cost) + (quantity * avg_cost)) / new_qty
-        conn.execute(
-            "UPDATE holdings SET quantity=?, avg_cost=? WHERE id=?",
-            (new_qty, new_avg, existing["id"])
-        )
+        sb().table("holdings").update({"quantity": new_qty, "avg_cost": new_avg}).eq("id", h["id"]).execute()
     else:
-        conn.execute("""
-            INSERT INTO holdings(portfolio_id,symbol,asset_class,quantity,avg_cost)
-            VALUES(?,?,?,?,?)
-        """, (portfolio_id, symbol, asset_class, quantity, avg_cost))
+        sb().table("holdings").insert({
+            "portfolio_id": portfolio_id, "symbol": symbol,
+            "asset_class": asset_class, "sub_class": sub_class,
+            "quantity": quantity, "unit_type": unit_type,
+            "avg_cost": avg_cost, "notes": notes,
+            "buy_date": str(date.today()),
+            "is_manual": is_manual,
+            "is_verified": not is_manual,
+        }).execute()
     # Log transaction
-    conn.execute("""
-        INSERT INTO transactions(portfolio_id,symbol,txn_type,quantity,price,amount)
-        VALUES(?,?,?,?,?,?)
-    """, (portfolio_id, symbol, "BUY", quantity, avg_cost, quantity * avg_cost))
-    conn.commit()
+    sb().table("transactions").insert({
+        "portfolio_id": portfolio_id, "symbol": symbol,
+        "txn_type": "BUY", "quantity": quantity,
+        "price": avg_cost, "amount": quantity * avg_cost,
+        "txn_date": str(date.today()), "notes": notes,
+    }).execute()
 
 def remove_holding(holding_id):
-    conn = get_user_conn()
-    conn.execute("DELETE FROM holdings WHERE id=?", (holding_id,))
-    conn.commit()
+    h = sb().table("holdings").select("*").eq("id", holding_id).execute()
+    if h.data:
+        hd = h.data[0]
+        sb().table("transactions").insert({
+            "portfolio_id": hd["portfolio_id"], "symbol": hd["symbol"],
+            "txn_type": "SELL", "quantity": hd["quantity"],
+            "price": hd["avg_cost"], "amount": hd["quantity"] * hd["avg_cost"],
+            "txn_date": str(date.today()),
+        }).execute()
+    sb().table("holdings").delete().eq("id", holding_id).execute()
 
 def get_transactions(portfolio_id):
-    conn = get_user_conn()
-    rows = conn.execute(
-        "SELECT * FROM transactions WHERE portfolio_id=? ORDER BY txn_date DESC",
-        (portfolio_id,)
-    ).fetchall()
-    return [dict(r) for r in rows]
+    r = sb().table("transactions").select("*").eq("portfolio_id", portfolio_id).order("created_at", desc=True).execute()
+    return r.data or []
 
-# Market helpers
-def get_all_assets():
-    conn = get_market_conn()
-    rows = conn.execute("SELECT a.*, p.close, p.change_pct FROM assets a LEFT JOIN prices p ON a.symbol=p.symbol").fetchall()
-    return [dict(r) for r in rows]
+# ── PENDING ASSETS (manual verification) ─────────────────────────────────
 
-def get_price(symbol):
-    conn = get_market_conn()
-    row = conn.execute("SELECT * FROM prices WHERE symbol=? ORDER BY price DESC LIMIT 1", (symbol,)).fetchone()
-    return dict(row) if row else None
+def submit_pending_asset(user_id, symbol, name, asset_class, sub_class="", isin="", notes=""):
+    sb().table("pending_assets").insert({
+        "submitted_by": user_id, "symbol": symbol.upper(),
+        "name": name, "asset_class": asset_class,
+        "sub_class": sub_class, "isin": isin, "notes": notes,
+    }).execute()
 
-def get_all_prices():
-    conn = get_market_conn()
-    rows = conn.execute("SELECT * FROM prices").fetchall()
-    return {r["symbol"]: dict(r) for r in rows}
+def get_pending_assets_for_user(user_id):
+    r = sb().table("pending_assets").select("*").eq("submitted_by", user_id).order("submitted_at", desc=True).execute()
+    return r.data or []
 
-def get_all_mfs():
-    conn = get_market_conn()
-    rows = conn.execute("SELECT * FROM mutual_funds").fetchall()
-    return [dict(r) for r in rows]
+def verify_asset_exists_nse(symbol: str) -> bool:
+    """Quick check against NSE API if a symbol exists."""
+    try:
+        url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol.upper()}"
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
+                   "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.nseindia.com"}
+        r = requests.get(url, headers=headers, timeout=5)
+        return r.status_code == 200 and "info" in r.json()
+    except Exception:
+        return False
 
-def get_mf_by_symbol(symbol):
-    conn = get_market_conn()
-    row = conn.execute("SELECT * FROM mutual_funds WHERE symbol=?", (symbol,)).fetchone()
-    return dict(row) if row else None
+# ── MEETINGS ──────────────────────────────────────────────────────────────
 
-def get_indices():
-    conn = get_market_conn()
-    rows = conn.execute("SELECT * FROM indices").fetchall()
-    return [dict(r) for r in rows]
+def create_meeting(advisor_id, ac_id, client_user_id, title, meeting_date,
+                   meeting_time, duration_mins=60, meet_link="", notes="", requested_by="advisor"):
+    sb().table("meetings").insert({
+        "advisor_id": advisor_id, "advisor_client_id": ac_id,
+        "client_user_id": client_user_id,
+        "title": title, "meeting_date": meeting_date,
+        "meeting_time": meeting_time, "duration_mins": duration_mins,
+        "meet_link": meet_link, "notes": notes, "requested_by": requested_by,
+    }).execute()
+
+def get_meetings_for_advisor(advisor_id):
+    r = sb().table("meetings").select("*").eq("advisor_id", advisor_id).order("meeting_date", desc=True).execute()
+    return r.data or []
+
+def get_meetings_for_client(client_user_id):
+    r = sb().table("meetings").select("*").eq("client_user_id", client_user_id).order("meeting_date", desc=True).execute()
+    return r.data or []
+
+def get_meeting_count_completed(ac_id):
+    r = sb().table("meetings").select("id").eq("advisor_client_id", ac_id).eq("status", "completed").execute()
+    return len(r.data or [])
+
+def update_meeting_status(meeting_id, status):
+    sb().table("meetings").update({"status": status}).eq("id", meeting_id).execute()
+
+def create_meeting_request(advisor_id, client_user_id, preferred_date, preferred_time, message=""):
+    sb().table("meeting_requests").insert({
+        "advisor_id": advisor_id, "client_user_id": client_user_id,
+        "preferred_date": preferred_date, "preferred_time": preferred_time,
+        "message": message,
+    }).execute()
+
+def get_pending_requests_for_advisor(advisor_id):
+    r = sb().table("meeting_requests").select("*, users!meeting_requests_client_user_id_fkey(full_name,email)").eq("advisor_id", advisor_id).eq("status", "pending").order("created_at", desc=True).execute()
+    result = []
+    for req in (r.data or []):
+        req["client_name"] = req.get("users", {}).get("full_name", "Client") if req.get("users") else "Client"
+        result.append(req)
+    return result
+
+def approve_meeting_request(req_id, advisor_id, client_user_id, title, d, t, dur, link, notes):
+    create_meeting(advisor_id, None, client_user_id, title, d, t, dur, link, notes, "client")
+    sb().table("meeting_requests").update({"status": "approved"}).eq("id", req_id).execute()
+
+def reject_meeting_request(req_id):
+    sb().table("meeting_requests").update({"status": "rejected"}).eq("id", req_id).execute()
+
+# ── INVOICES ──────────────────────────────────────────────────────────────
+
+def _next_invoice_number() -> str:
+    """Generate collision-proof invoice number using timestamp + random suffix."""
+    import uuid, secrets
+    now    = datetime.now()
+    suffix = secrets.token_hex(2).upper()          # 4-char random hex
+    return f"INV-{now.year}{now.month:02d}-{now.strftime('%d%H%M')}-{suffix}"
+
+def create_invoice(advisor_id, ac_id, fee_type, fee_value, fee_frequency,
+                   amount, portfolio_value=0, num_meetings=0,
+                   period_from="", period_to="", notes="",
+                   invoice_date=None, due_date=None):
+    inv_num  = _next_invoice_number()
+    inv_date = invoice_date or str(date.today())
+    due      = due_date     or str(date.today() + timedelta(days=15))
+    sb().table("invoices").insert({
+        "invoice_number": inv_num,
+        "advisor_id": advisor_id, "advisor_client_id": ac_id,
+        "invoice_date": inv_date, "due_date": due,
+        "fee_type": fee_type, "fee_value": fee_value,
+        "fee_frequency": fee_frequency, "amount": amount,
+        "portfolio_value": portfolio_value, "num_meetings": num_meetings,
+        "period_from": period_from, "period_to": period_to, "notes": notes,
+    }).execute()
+    return inv_num
+
+# ── CSV/EXCEL MARKET DATA UPLOAD ──────────────────────────────────────────
+# Called with a special upload key to let advisor populate market data
+
+def upsert_prices_from_df(df):
+    """
+    df columns required: symbol, close
+    optional: open, high, low, prev_close, change_pct, volume
+    """
+    now   = datetime.now().isoformat()
+    today = str(date.today())
+    count = 0
+    for _, row in df.iterrows():
+        sym = str(row.get("symbol","")).strip().upper()
+        if not sym: continue
+        cl  = float(row.get("close", row.get("ltp", row.get("last_price", 0))) or 0)
+        if cl <= 0: continue
+        prev = float(row.get("prev_close", row.get("previous_close", cl)) or cl)
+        chg  = float(row.get("change_pct", row.get("pchange", ((cl-prev)/prev*100) if prev else 0)) or 0)
+        try:
+            sb().table("prices").upsert({
+                "symbol": sym, "price_date": today,
+                "open":   float(row.get("open",   cl) or cl),
+                "high":   float(row.get("high",   cl) or cl),
+                "low":    float(row.get("low",    cl) or cl),
+                "close":  cl, "prev_close": prev,
+                "change_pct": round(chg, 4),
+                "volume": int(row.get("volume", 0) or 0),
+                "last_updated": now,
+            }, on_conflict="symbol,price_date").execute()
+            count += 1
+        except Exception:
+            pass
+    # Clear cache so new prices show immediately
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    return count
+
+def upsert_navs_from_df(df):
+    """
+    df columns required: symbol, nav
+    optional: prev_nav, change_pct, fund_house, scheme_code
+    """
+    now   = datetime.now().isoformat()
+    today = str(date.today())
+    count = 0
+    for _, row in df.iterrows():
+        sym = str(row.get("symbol","")).strip().upper()
+        if not sym: continue
+        nav  = float(row.get("nav", row.get("NAV", 0)) or 0)
+        if nav <= 0: continue
+        prev = float(row.get("prev_nav", nav) or nav)
+        chg  = float(row.get("change_pct", ((nav-prev)/prev*100) if prev else 0) or 0)
+        try:
+            sb().table("mutual_funds").update({
+                "nav": nav, "prev_nav": prev,
+                "change_pct": round(chg, 4),
+                "nav_date": today, "last_updated": now,
+            }).eq("symbol", sym).execute()
+            count += 1
+        except Exception:
+            pass
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    return count
+
+def get_invoices_for_advisor(advisor_id):
+    r = sb().table("invoices").select("*").eq("advisor_id", advisor_id).order("created_at", desc=True).execute()
+    return r.data or []
+
+def update_invoice_status(inv_id, status):
+    sb().table("invoices").update({"status": status}).eq("id", inv_id).execute()
+
+# ── MARKET DATA ───────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600)
+def get_indices(_v=0):
+    r = sb().table("indices").select("*").execute()
+    return r.data or []
+
+@st.cache_data(ttl=3600)
+def get_all_prices_map(_v=0):
+    r = sb().table("prices").select("symbol,close,change_pct,change_amt,open,high,low,prev_close,volume,price_date").order("price_date", desc=True).execute()
+    seen = {}
+    for row in (r.data or []):
+        if row["symbol"] not in seen:
+            seen[row["symbol"]] = row
+    return seen
+
+@st.cache_data(ttl=3600)
+def get_price_history(symbol: str, days: int = 365, _v=0):
+    cutoff = str(date.today() - timedelta(days=days))
+    r = sb().table("prices").select("price_date,close,open,high,low,volume").eq("symbol", symbol).gte("price_date", cutoff).order("price_date").execute()
+    return r.data or []
+
+@st.cache_data(ttl=3600)
+def get_assets(asset_class=None, sub_class=None, search=None, _v=0):
+    q = sb().table("assets").select("*").eq("is_active", True)
+    if asset_class:
+        q = q.eq("asset_class", asset_class)
+    if sub_class:
+        q = q.eq("sub_class", sub_class)
+    data = q.execute().data or []
+    if search:
+        s = search.lower()
+        data = [a for a in data if s in a["symbol"].lower() or s in a["name"].lower()]
+    return data
+
+@st.cache_data(ttl=3600)
+def get_mutual_funds(category=None, sub_category=None, search=None, _v=0):
+    q = sb().table("mutual_funds").select("*")
+    if category:
+        q = q.eq("category", category)
+    if sub_category:
+        q = q.eq("sub_category", sub_category)
+    data = q.execute().data or []
+    if search:
+        s = search.lower()
+        data = [m for m in data if s in m["name"].lower() or s in m.get("fund_house","").lower()]
+    return data
+
+@st.cache_data(ttl=3600)
+def get_mf_by_symbol(symbol, _v=0):
+    r = sb().table("mutual_funds").select("*").eq("symbol", symbol).execute()
+    return r.data[0] if r.data else None
+
+@st.cache_data(ttl=3600)
+def get_fixed_income(asset_class=None, _v=0):
+    q = sb().table("fixed_income").select("*")
+    if asset_class:
+        q = q.eq("asset_class", asset_class)
+    return q.execute().data or []
+
+@st.cache_data(ttl=3600)
+def get_commodities(_v=0):
+    r = sb().table("commodities").select("*").execute()
+    return r.data or []
+
+def get_asset_price(symbol: str):
+    """Universal price lookup. Returns (price, change_pct)."""
+    prices = get_all_prices_map()
+    if symbol in prices:
+        p = prices[symbol]
+        return p["close"], p.get("change_pct", 0)
+    # MF NAV
+    r = sb().table("mutual_funds").select("nav,change_pct").eq("symbol", symbol).execute()
+    if r.data and r.data[0]["nav"]:
+        return r.data[0]["nav"], r.data[0].get("change_pct", 0)
+    # Fixed income
+    r2 = sb().table("fixed_income").select("current_price").eq("symbol", symbol).execute()
+    if r2.data and r2.data[0]["current_price"]:
+        return r2.data[0]["current_price"], 0.0
+    # Commodity
+    r3 = sb().table("commodities").select("price_per_unit,change_pct").eq("symbol", symbol).execute()
+    if r3.data and r3.data[0]["price_per_unit"]:
+        return r3.data[0]["price_per_unit"], r3.data[0].get("change_pct", 0)
+    return 0.0, 0.0
+
+def get_asset_info(symbol: str):
+    """Get asset master info from any table."""
+    r = sb().table("assets").select("*").eq("symbol", symbol).execute()
+    if r.data:
+        return r.data[0]
+    r2 = sb().table("mutual_funds").select("*").eq("symbol", symbol).execute()
+    if r2.data:
+        return r2.data[0]
+    r3 = sb().table("fixed_income").select("*").eq("symbol", symbol).execute()
+    if r3.data:
+        return r3.data[0]
+    r4 = sb().table("commodities").select("*").eq("symbol", symbol).execute()
+    if r4.data:
+        return r4.data[0]
+    return None
